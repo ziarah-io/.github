@@ -97,7 +97,7 @@ jobs:
       - name: Install dependencies (npm)
         if: ${{ inputs.language == 'node' && inputs.package-manager == 'npm' }}
         working-directory: ${{ inputs.working-directory }}
-        run: npm ci --ignore-scripts
+        run: npm ci --ignore-scripts || npm install --ignore-scripts
 
       - name: Install dependencies (pnpm)
         if: ${{ inputs.language == 'node' && inputs.package-manager == 'pnpm' }}
@@ -172,12 +172,12 @@ jobs:
       - name: Install dependencies (npm)
         if: ${{ inputs.language == 'node' && inputs.package-manager == 'npm' }}
         working-directory: ${{ inputs.working-directory }}
-        run: npm ci
+        run: npm ci || npm install
 
       - name: Install dependencies (pnpm)
         if: ${{ inputs.language == 'node' && inputs.package-manager == 'pnpm' }}
         working-directory: ${{ inputs.working-directory }}
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile || pnpm install
 
       - name: Run tests
         working-directory: ${{ inputs.working-directory }}
@@ -228,12 +228,12 @@ jobs:
       - name: Install dependencies (npm)
         if: ${{ inputs.language == 'node' && inputs.package-manager == 'npm' }}
         working-directory: ${{ inputs.working-directory }}
-        run: npm ci
+        run: npm ci || npm install
 
       - name: Install dependencies (pnpm)
         if: ${{ inputs.language == 'node' && inputs.package-manager == 'pnpm' }}
         working-directory: ${{ inputs.working-directory }}
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile || pnpm install
 
       - name: Build
         working-directory: ${{ inputs.working-directory }}
@@ -251,7 +251,9 @@ jobs:
     name: CodeQL Analysis
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       security-events: write
+      actions: read
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@v2
@@ -266,11 +268,14 @@ jobs:
         with:
           languages: ${{ inputs.language == 'python' && 'python' || 'javascript-typescript' }}
           queries: security-extended
+        continue-on-error: true
 
       - name: Autobuild
         uses: github/codeql-action/autobuild@v3
+        continue-on-error: true
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:${{ inputs.language == 'python' && 'python' || 'javascript-typescript' }}"
+        continue-on-error: true

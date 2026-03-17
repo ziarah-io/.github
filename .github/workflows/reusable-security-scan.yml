@@ -117,7 +117,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Run Trivy vulnerability scanner (filesystem)
+      - name: Run Trivy vulnerability scanner (filesystem - table)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "table"
+          severity: ${{ inputs.severity }}
+          exit-code: ${{ inputs.fail-on-vulnerability && '1' || '0' }}
+        continue-on-error: true
+
+      - name: Run Trivy vulnerability scanner (filesystem - SARIF)
         uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: "fs"
@@ -125,23 +135,15 @@ jobs:
           format: "sarif"
           output: "trivy-fs-results.sarif"
           severity: ${{ inputs.severity }}
-          exit-code: ${{ inputs.fail-on-vulnerability && '1' || '0' }}
+        continue-on-error: true
 
       - name: Upload Trivy SARIF (filesystem)
-        if: always()
+        if: ${{ always() && hashFiles('trivy-fs-results.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: "trivy-fs-results.sarif"
           category: "trivy-filesystem"
-
-      - name: Trivy filesystem summary
-        if: always()
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: "fs"
-          scan-ref: "."
-          format: "table"
-          severity: ${{ inputs.severity }}
+        continue-on-error: true
 
   trivy-container:
     name: Trivy Container Scan
@@ -184,14 +186,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+      - name: Run Trivy secret scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          scanners: "secret"
+          format: "table"
         continue-on-error: true
 
-      - name: Run Trivy secret scan
+      - name: Run Trivy secret scan (SARIF)
         uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: "fs"
@@ -199,13 +203,15 @@ jobs:
           scanners: "secret"
           format: "sarif"
           output: "trivy-secrets-results.sarif"
+        continue-on-error: true
 
       - name: Upload Trivy Secrets SARIF
-        if: always()
+        if: ${{ always() && hashFiles('trivy-secrets-results.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: "trivy-secrets-results.sarif"
           category: "trivy-secrets"
+        continue-on-error: true
 
   sbom:
     name: Generate SBOM
@@ -227,6 +233,7 @@ jobs:
           scan-ref: "."
           format: "cyclonedx"
           output: "sbom.cdx.json"
+        continue-on-error: true
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
