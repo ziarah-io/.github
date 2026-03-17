@@ -40,6 +40,11 @@ on:
         required: false
         type: boolean
         default: true
+      run-codeql:
+        description: "Whether to run CodeQL analysis"
+        required: false
+        type: boolean
+        default: true
       language:
         description: "Project language (node or python)"
         required: false
@@ -250,6 +255,7 @@ jobs:
   codeql:
     name: CodeQL Analysis
     runs-on: ubuntu-latest
+    if: ${{ inputs.run-codeql }}
     permissions:
       contents: read
       security-events: write
