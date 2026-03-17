@@ -1,0 +1,194 @@
+# Reusable AKS Deployment Workflow
+# Deploys container image to Azure Kubernetes Service with safety checks
+name: Reusable Deploy to AKS
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Docker image name (without registry prefix)"
+        required: true
+        type: string
+      environment:
+        description: "Deployment environment (alpha or production)"
+        required: true
+        type: string
+      cluster-name:
+        description: "AKS cluster name"
+        required: true
+        type: string
+      resource-group:
+        description: "Azure resource group"
+        required: false
+        type: string
+        default: "ztai"
+      namespace:
+        description: "Kubernetes namespace"
+        required: false
+        type: string
+        default: "default"
+      deployment-name:
+        description: "Kubernetes deployment name"
+        required: true
+        type: string
+      container-name:
+        description: "Container name within the deployment"
+        required: true
+        type: string
+      rollout-timeout:
+        description: "Timeout for rollout status check (e.g., 300s)"
+        required: false
+        type: string
+        default: "300s"
+      enable-notifications:
+        description: "Whether to send Teams notifications"
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      ACR_LOGIN_SERVER:
+        required: true
+      AZURE_CREDENTIALS:
+        required: true
+      MS_TEAMS_WEBHOOK_URI:
+        required: false
+      PAT_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ inputs.resource-group }}
+          cluster-name: ${{ inputs.cluster-name }}
+
+      - name: Get current deployment state
+        id: pre-deploy
+        run: |
+          echo "## Pre-deployment State" >> $GITHUB_STEP_SUMMARY
+          CURRENT_IMAGE=$(kubectl get deployment ${{ inputs.deployment-name }} -n ${{ inputs.namespace }} -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "none")
+          CURRENT_REPLICAS=$(kubectl get deployment ${{ inputs.deployment-name }} -n ${{ inputs.namespace }} -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+          echo "current-image=${CURRENT_IMAGE}" >> $GITHUB_OUTPUT
+          echo "current-replicas=${CURRENT_REPLICAS}" >> $GITHUB_OUTPUT
+          echo "- Current image: ${CURRENT_IMAGE}" >> $GITHUB_STEP_SUMMARY
+          echo "- Ready replicas: ${CURRENT_REPLICAS}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Deploy image
+        id: deploy
+        run: |
+          VERSION="${{ vars.VERSION || '1.0.0' }}"
+          IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image-name }}:${VERSION}"
+          echo "Deploying image: ${IMAGE}"
+          kubectl set image deployment/${{ inputs.deployment-name }} \
+            ${{ inputs.container-name }}=${IMAGE} \
+            -n ${{ inputs.namespace }}
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Wait for rollout
+        id: rollout
+        run: |
+          if kubectl rollout status deployment/${{ inputs.deployment-name }} \
+            -n ${{ inputs.namespace }} \
+            --timeout=${{ inputs.rollout-timeout }}; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "## Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "## Deployment Failed - Rolling Back" >> $GITHUB_STEP_SUMMARY
+            echo "::error::Rollout failed. Initiating rollback."
+          fi
+
+      - name: Rollback on failure
+        if: ${{ steps.rollout.outputs.status == 'failed' }}
+        run: |
+          echo "Rolling back deployment..."
+          kubectl rollout undo deployment/${{ inputs.deployment-name }} -n ${{ inputs.namespace }}
+          kubectl rollout status deployment/${{ inputs.deployment-name }} -n ${{ inputs.namespace }} --timeout=120s
+          echo "Rollback completed."
+          exit 1
+
+      - name: Post-deployment health check
+        if: ${{ steps.rollout.outputs.status == 'success' }}
+        run: |
+          echo "Running post-deployment health check..."
+          sleep 10
+          READY=$(kubectl get deployment ${{ inputs.deployment-name }} -n ${{ inputs.namespace }} -o jsonpath='{.status.readyReplicas}')
+          DESIRED=$(kubectl get deployment ${{ inputs.deployment-name }} -n ${{ inputs.namespace }} -o jsonpath='{.spec.replicas}')
+          echo "Ready: ${READY}/${DESIRED}"
+          if [ "${READY}" != "${DESIRED}" ]; then
+            echo "::warning::Not all replicas are ready after deployment"
+          fi
+          echo "- Ready replicas: ${READY}/${DESIRED}" >> $GITHUB_STEP_SUMMARY
+
+  update-version:
+    name: Update Version
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Increment version
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT="${{ vars.VERSION || '1.0.0' }}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          PATCH=$((PATCH + 1))
+          if [ "$PATCH" -ge 100 ]; then
+            PATCH=0
+            MINOR=$((MINOR + 1))
+          fi
+          if [ "$MINOR" -ge 100 ]; then
+            MINOR=0
+            MAJOR=$((MAJOR + 1))
+          fi
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "Version: ${CURRENT} -> ${NEW_VERSION}"
+          gh variable set VERSION --body "${NEW_VERSION}" --repo "${{ github.repository }}" || echo "::warning::Failed to update version variable"
+
+  notify:
+    name: Send Notification
+    runs-on: ubuntu-latest
+    needs: [deploy, update-version]
+    if: ${{ inputs.enable-notifications && always() }}
+    steps:
+      - name: Notify Teams - Success
+        if: ${{ needs.deploy.result == 'success' }}
+        uses: jdcargile/ms-teams-notification@v1.4
+        with:
+          github-token: ${{ github.token }}
+          ms-teams-webhook-uri: ${{ secrets.MS_TEAMS_WEBHOOK_URI }}
+          notification-summary: "${{ inputs.image-name }} deployed to ${{ inputs.environment }}"
+          notification-color: 28a745
+          timezone: UTC
+        continue-on-error: true
+
+      - name: Notify Teams - Failure
+        if: ${{ needs.deploy.result == 'failure' }}
+        uses: jdcargile/ms-teams-notification@v1.4
+        with:
+          github-token: ${{ github.token }}
+          ms-teams-webhook-uri: ${{ secrets.MS_TEAMS_WEBHOOK_URI }}
+          notification-summary: "FAILED: ${{ inputs.image-name }} deployment to ${{ inputs.environment }}"
+          notification-color: dc3545
+          timezone: UTC
+        continue-on-error: true

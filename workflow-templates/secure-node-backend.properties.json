@@ -1,0 +1,6 @@
+{
+  "name": "Secure Node.js Backend CI/CD",
+  "description": "CI/CD with security scanning for Node.js backend services",
+  "iconName": "nodejs",
+  "categories": ["Node.js", "TypeScript"]
+}

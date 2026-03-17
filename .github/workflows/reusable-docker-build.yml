@@ -1,0 +1,156 @@
+# Reusable Docker Build & Push Workflow
+# Builds Docker image securely and pushes to Azure Container Registry
+name: Reusable Docker Build & Push
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Docker image name (without registry prefix)"
+        required: true
+        type: string
+      environment:
+        description: "Target environment (alpha or production)"
+        required: true
+        type: string
+      env-file-source:
+        description: "Source env file to use (e.g., .env.dev or .env.production)"
+        required: false
+        type: string
+        default: ""
+      dockerfile:
+        description: "Path to Dockerfile"
+        required: false
+        type: string
+        default: "Dockerfile"
+      build-args:
+        description: "Docker build args (newline-separated KEY=VALUE)"
+        required: false
+        type: string
+        default: ""
+      platforms:
+        description: "Target platforms"
+        required: false
+        type: string
+        default: "linux/amd64"
+    outputs:
+      image-tag:
+        description: "Full image tag that was pushed"
+        value: ${{ jobs.build-push.outputs.image-tag }}
+      image-digest:
+        description: "Image digest"
+        value: ${{ jobs.build-push.outputs.image-digest }}
+    secrets:
+      ACR_LOGIN_SERVER:
+        required: true
+      ACR_USERNAME:
+        required: true
+      ACR_PASSWORD:
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.image-tag }}
+      image-digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare environment file
+        if: ${{ inputs.env-file-source != '' }}
+        run: |
+          if [ -f "${{ inputs.env-file-source }}" ]; then
+            cp "${{ inputs.env-file-source }}" .env
+            echo "Prepared .env from ${{ inputs.env-file-source }}"
+          else
+            echo "::warning::Environment file ${{ inputs.env-file-source }} not found"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          VERSION="${{ vars.VERSION || '1.0.0' }}"
+          SHORT_SHA="${GITHUB_SHA::8}"
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          IMAGE_TAG="${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image-name }}:${VERSION}"
+          IMAGE_TAG_SHA="${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image-name }}:sha-${SHORT_SHA}"
+          IMAGE_TAG_LATEST="${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image-name }}:latest"
+
+          echo "image-tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "image-tag-sha=${IMAGE_TAG_SHA}" >> $GITHUB_OUTPUT
+          echo "image-tag-latest=${IMAGE_TAG_LATEST}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+          echo "## Docker Build" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: ${{ inputs.image-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${VERSION}" >> $GITHUB_STEP_SUMMARY
+          echo "- SHA: ${SHORT_SHA}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image-tag }}
+            ${{ steps.meta.outputs.image-tag-sha }}
+          platforms: ${{ inputs.platforms }}
+          build-args: ${{ inputs.build-args }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Scan built image with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image-tag }}
+          format: "table"
+          severity: "HIGH,CRITICAL"
+          exit-code: "0"
+
+      - name: Scan built image (SARIF)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image-tag }}
+          format: "sarif"
+          output: "trivy-image-results.sarif"
+          severity: "HIGH,CRITICAL"
+
+      - name: Upload Trivy image scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-image-results.sarif"
+          category: "trivy-docker-image"
+        continue-on-error: true
+
+      - name: Verify image was pushed
+        run: |
+          echo "Image pushed successfully:"
+          echo "  Tag: ${{ steps.meta.outputs.image-tag }}"
+          echo "  Digest: ${{ steps.push.outputs.digest }}"

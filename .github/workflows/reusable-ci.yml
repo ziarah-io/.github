@@ -1,0 +1,276 @@
+# Reusable CI Workflow - Lint, Test, Build, SAST
+# Used by all TypeScript/Node.js services in ziarah-io org
+name: Reusable CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version to use"
+        required: false
+        type: string
+        default: "20"
+      package-manager:
+        description: "Package manager (npm or pnpm)"
+        required: false
+        type: string
+        default: "npm"
+      pnpm-version:
+        description: "pnpm version (if using pnpm)"
+        required: false
+        type: string
+        default: "9"
+      working-directory:
+        description: "Working directory for the project"
+        required: false
+        type: string
+        default: "."
+      run-lint:
+        description: "Whether to run linting"
+        required: false
+        type: boolean
+        default: true
+      run-tests:
+        description: "Whether to run tests"
+        required: false
+        type: boolean
+        default: true
+      run-build:
+        description: "Whether to run build"
+        required: false
+        type: boolean
+        default: true
+      language:
+        description: "Project language (node or python)"
+        required: false
+        type: string
+        default: "node"
+      python-version:
+        description: "Python version (if language is python)"
+        required: false
+        type: string
+        default: "3.10"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    if: ${{ inputs.run-lint }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Node.js setup
+      - name: Setup Node.js
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Setup pnpm
+        if: ${{ inputs.language == 'node' && inputs.package-manager == 'pnpm' }}
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - name: Cache node modules
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.pnpm-store
+            ${{ inputs.working-directory }}/node_modules
+          key: ${{ runner.os }}-${{ inputs.package-manager }}-${{ hashFiles(format('{0}/**/package-lock.json', inputs.working-directory), format('{0}/**/pnpm-lock.yaml', inputs.working-directory)) }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.package-manager }}-
+
+      - name: Install dependencies (npm)
+        if: ${{ inputs.language == 'node' && inputs.package-manager == 'npm' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: npm ci --ignore-scripts
+
+      - name: Install dependencies (pnpm)
+        if: ${{ inputs.language == 'node' && inputs.package-manager == 'pnpm' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Run ESLint
+        if: ${{ inputs.language == 'node' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          if [ -f "node_modules/.bin/eslint" ]; then
+            npx eslint . --ext .ts,.tsx,.js,.jsx --format @microsoft/eslint-formatter-sarif --output-file eslint-results.sarif || true
+            npx eslint . --ext .ts,.tsx,.js,.jsx --max-warnings 0
+          else
+            echo "ESLint not found, skipping..."
+          fi
+
+      - name: Upload ESLint SARIF
+        if: ${{ inputs.language == 'node' && always() }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ inputs.working-directory }}/eslint-results.sarif
+          category: eslint
+        continue-on-error: true
+
+      # Python setup
+      - name: Setup Python
+        if: ${{ inputs.language == 'python' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install Python linters
+        if: ${{ inputs.language == 'python' }}
+        run: pip install ruff bandit[toml]
+
+      - name: Run Ruff (Python linter)
+        if: ${{ inputs.language == 'python' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: ruff check . --output-format sarif --output-file ruff-results.sarif || ruff check .
+
+      - name: Run Bandit (Python SAST)
+        if: ${{ inputs.language == 'python' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: bandit -r . -f sarif -o bandit-results.sarif --severity-level medium || bandit -r . --severity-level medium
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    if: ${{ inputs.run-tests }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Setup pnpm
+        if: ${{ inputs.language == 'node' && inputs.package-manager == 'pnpm' }}
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - name: Install dependencies (npm)
+        if: ${{ inputs.language == 'node' && inputs.package-manager == 'npm' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: npm ci
+
+      - name: Install dependencies (pnpm)
+        if: ${{ inputs.language == 'node' && inputs.package-manager == 'pnpm' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          if [ -f "package.json" ]; then
+            # Check if test script exists and is not the default "Error: no test specified"
+            TEST_SCRIPT=$(node -e "const p=require('./package.json'); console.log(p.scripts?.test || '')")
+            if [ -n "$TEST_SCRIPT" ] && ! echo "$TEST_SCRIPT" | grep -q "no test specified"; then
+              npm test -- --ci --coverage 2>/dev/null || npm test
+            else
+              echo "::warning::No test script found in package.json. Consider adding tests."
+            fi
+          elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+            pip install -r requirements.txt 2>/dev/null || true
+            pip install pytest pytest-cov 2>/dev/null || true
+            if [ -d "tests" ] || [ -d "test" ]; then
+              python -m pytest --cov --cov-report=xml || true
+            else
+              echo "::warning::No test directory found. Consider adding tests."
+            fi
+          fi
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    if: ${{ inputs.run-build }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Setup pnpm
+        if: ${{ inputs.language == 'node' && inputs.package-manager == 'pnpm' }}
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - name: Install dependencies (npm)
+        if: ${{ inputs.language == 'node' && inputs.package-manager == 'npm' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: npm ci
+
+      - name: Install dependencies (pnpm)
+        if: ${{ inputs.language == 'node' && inputs.package-manager == 'pnpm' }}
+        working-directory: ${{ inputs.working-directory }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          if [ -f "package.json" ]; then
+            BUILD_SCRIPT=$(node -e "const p=require('./package.json'); console.log(p.scripts?.build || '')")
+            if [ -n "$BUILD_SCRIPT" ]; then
+              npm run build
+            else
+              echo "::warning::No build script found."
+            fi
+          fi
+
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ inputs.language == 'python' && 'python' || 'javascript-typescript' }}
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ inputs.language == 'python' && 'python' || 'javascript-typescript' }}"

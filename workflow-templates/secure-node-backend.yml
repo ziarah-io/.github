@@ -1,0 +1,26 @@
+name: Secure Node.js Backend CI/CD
+on:
+  push:
+    branches: [main, alpha]
+  pull_request:
+    branches: [main, alpha]
+jobs:
+  ci:
+    uses: ziarah-io/.github/.github/workflows/reusable-ci.yml@main
+    with:
+      node-version: "20"
+      language: "node"
+    permissions:
+      contents: read
+      security-events: write
+  security:
+    uses: ziarah-io/.github/.github/workflows/reusable-security-scan.yml@main
+    with:
+      scan-filesystem: true
+      scan-secrets: true
+      generate-sbom: true
+      language: "node"
+    permissions:
+      contents: read
+      security-events: write
+    secrets: inherit

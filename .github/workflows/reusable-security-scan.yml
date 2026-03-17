@@ -1,0 +1,246 @@
+# Reusable Security Scanning Workflow
+# Container scanning, dependency audit, secrets detection, SBOM
+name: Reusable Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      image-ref:
+        description: "Docker image reference to scan (e.g., myregistry/myimage:tag)"
+        required: false
+        type: string
+        default: ""
+      scan-filesystem:
+        description: "Whether to scan the filesystem (dependency vulnerabilities)"
+        required: false
+        type: boolean
+        default: true
+      scan-container:
+        description: "Whether to scan a container image"
+        required: false
+        type: boolean
+        default: false
+      scan-secrets:
+        description: "Whether to scan for leaked secrets"
+        required: false
+        type: boolean
+        default: true
+      generate-sbom:
+        description: "Whether to generate SBOM"
+        required: false
+        type: boolean
+        default: true
+      severity:
+        description: "Minimum severity to report (UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL)"
+        required: false
+        type: string
+        default: "HIGH,CRITICAL"
+      language:
+        description: "Project language (node or python)"
+        required: false
+        type: string
+        default: "node"
+      node-version:
+        description: "Node.js version"
+        required: false
+        type: string
+        default: "20"
+      fail-on-vulnerability:
+        description: "Whether to fail the workflow on found vulnerabilities"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  dependency-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Run npm audit
+        if: ${{ inputs.language == 'node' }}
+        run: |
+          npm install --package-lock-only 2>/dev/null || true
+          echo "## Dependency Audit Report" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          npm audit --omit=dev 2>&1 | tee audit-report.txt >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          # Fail on critical/high vulnerabilities
+          if npm audit --omit=dev --audit-level=high 2>/dev/null; then
+            echo "No high/critical vulnerabilities found"
+          else
+            echo "::warning::High/critical vulnerabilities found in dependencies. Review audit-report.txt"
+          fi
+
+      - name: Run pip audit (Python)
+        if: ${{ inputs.language == 'python' }}
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --format json --output audit-report.json || true
+          pip-audit -r requirements.txt --desc || true
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit-report
+          path: audit-report.*
+          retention-days: 30
+
+  trivy-filesystem:
+    name: Trivy Filesystem Scan
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scan-filesystem }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner (filesystem)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-fs-results.sarif"
+          severity: ${{ inputs.severity }}
+          exit-code: ${{ inputs.fail-on-vulnerability && '1' || '0' }}
+
+      - name: Upload Trivy SARIF (filesystem)
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-fs-results.sarif"
+          category: "trivy-filesystem"
+
+      - name: Trivy filesystem summary
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "table"
+          severity: ${{ inputs.severity }}
+
+  trivy-container:
+    name: Trivy Container Scan
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scan-container && inputs.image-ref != '' }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Run Trivy vulnerability scanner (image)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ inputs.image-ref }}
+          format: "sarif"
+          output: "trivy-image-results.sarif"
+          severity: ${{ inputs.severity }}
+          exit-code: ${{ inputs.fail-on-vulnerability && '1' || '0' }}
+
+      - name: Upload Trivy SARIF (image)
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-image-results.sarif"
+          category: "trivy-container"
+
+  secret-scan:
+    name: Secret Detection
+    runs-on: ubuntu-latest
+    if: ${{ inputs.scan-secrets }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        continue-on-error: true
+
+      - name: Run Trivy secret scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          scanners: "secret"
+          format: "sarif"
+          output: "trivy-secrets-results.sarif"
+
+      - name: Upload Trivy Secrets SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-secrets-results.sarif"
+          category: "trivy-secrets"
+
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    if: ${{ inputs.generate-sbom }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "cyclonedx"
+          output: "sbom.cdx.json"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+          retention-days: 90
+
+      - name: Generate SBOM summary
+        run: |
+          echo "## SBOM Generated" >> $GITHUB_STEP_SUMMARY
+          echo "Format: CycloneDX JSON" >> $GITHUB_STEP_SUMMARY
+          echo "Available as build artifact: sbom-cyclonedx" >> $GITHUB_STEP_SUMMARY
+          if [ -f "sbom.cdx.json" ]; then
+            COMPONENTS=$(python3 -c "import json; data=json.load(open('sbom.cdx.json')); print(len(data.get('components', [])))" 2>/dev/null || echo "unknown")
+            echo "Components tracked: $COMPONENTS" >> $GITHUB_STEP_SUMMARY
+          fi

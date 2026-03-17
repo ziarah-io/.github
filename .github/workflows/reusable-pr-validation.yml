@@ -1,0 +1,229 @@
+# Reusable PR Validation Workflow
+# Runs on pull requests to validate code quality and security before merge
+name: Reusable PR Validation
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version"
+        required: false
+        type: string
+        default: "20"
+      package-manager:
+        description: "Package manager (npm or pnpm)"
+        required: false
+        type: string
+        default: "npm"
+      pnpm-version:
+        description: "pnpm version"
+        required: false
+        type: string
+        default: "9"
+      language:
+        description: "Project language (node or python)"
+        required: false
+        type: string
+        default: "node"
+      python-version:
+        description: "Python version"
+        required: false
+        type: string
+        default: "3.10"
+      require-tests:
+        description: "Fail if no tests exist"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  pr-checks:
+    name: PR Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for large files
+        run: |
+          MAX_SIZE=5242880  # 5MB
+          LARGE_FILES=""
+          while IFS= read -r file; do
+            if [ -f "$file" ]; then
+              SIZE=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo 0)
+              if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+                LARGE_FILES="${LARGE_FILES}\n- ${file} ($(numfmt --to=iec $SIZE 2>/dev/null || echo ${SIZE}B))"
+              fi
+            fi
+          done < <(git diff --name-only origin/${{ github.base_ref }}...HEAD 2>/dev/null || git diff --name-only HEAD~1)
+          if [ -n "$LARGE_FILES" ]; then
+            echo "::warning::Large files detected in PR:${LARGE_FILES}"
+          fi
+
+      - name: Check for sensitive files
+        run: |
+          SENSITIVE_PATTERNS=(.env .env.local .env.production credentials.json service-account.json *.pem *.key *.p12 *.pfx id_rsa id_dsa)
+          ISSUES=""
+          for pattern in "${SENSITIVE_PATTERNS[@]}"; do
+            MATCHES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD 2>/dev/null | grep -E "(^|/)${pattern}$" || true)
+            if [ -n "$MATCHES" ]; then
+              ISSUES="${ISSUES}\n- ${MATCHES}"
+            fi
+          done
+          if [ -n "$ISSUES" ]; then
+            echo "::error::Sensitive files detected in PR. These should NOT be committed:${ISSUES}"
+            exit 1
+          fi
+
+      - name: Check for hardcoded secrets
+        run: |
+          # Simple pattern matching for common secret patterns
+          PATTERNS=(
+            'password\s*[:=]\s*["\x27][^"\x27]{8,}'
+            'api[_-]?key\s*[:=]\s*["\x27][A-Za-z0-9]{16,}'
+            'secret\s*[:=]\s*["\x27][^"\x27]{8,}'
+            'token\s*[:=]\s*["\x27][A-Za-z0-9]{16,}'
+            'AKIA[0-9A-Z]{16}'
+            'mongodb(\+srv)?://[^/\s]+'
+            'redis://[^/\s]+'
+          )
+          FOUND=false
+          for pattern in "${PATTERNS[@]}"; do
+            MATCHES=$(git diff origin/${{ github.base_ref }}...HEAD 2>/dev/null | grep -iP "$pattern" | grep "^+" | head -5 || true)
+            if [ -n "$MATCHES" ]; then
+              echo "::warning::Potential hardcoded secret detected matching pattern: ${pattern}"
+              FOUND=true
+            fi
+          done
+          if [ "$FOUND" = true ]; then
+            echo "::warning::Review the warnings above for potential hardcoded secrets"
+          fi
+
+  lint-and-build:
+    name: Lint & Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Setup pnpm
+        if: ${{ inputs.language == 'node' && inputs.package-manager == 'pnpm' }}
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+
+      - name: Install dependencies (npm)
+        if: ${{ inputs.language == 'node' && inputs.package-manager == 'npm' }}
+        run: npm ci
+
+      - name: Install dependencies (pnpm)
+        if: ${{ inputs.language == 'node' && inputs.package-manager == 'pnpm' }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        if: ${{ inputs.language == 'node' }}
+        run: |
+          if npm run lint --if-present 2>/dev/null; then
+            echo "Lint passed"
+          else
+            echo "::error::Linting failed. Fix lint errors before merging."
+            exit 1
+          fi
+
+      - name: TypeScript check
+        if: ${{ inputs.language == 'node' }}
+        run: |
+          if [ -f "tsconfig.json" ]; then
+            npx tsc --noEmit || { echo "::error::TypeScript type checking failed"; exit 1; }
+          fi
+
+      - name: Build
+        if: ${{ inputs.language == 'node' }}
+        run: |
+          BUILD_SCRIPT=$(node -e "const p=require('./package.json'); console.log(p.scripts?.build || '')")
+          if [ -n "$BUILD_SCRIPT" ]; then
+            npm run build
+          fi
+
+      - name: Setup Python
+        if: ${{ inputs.language == 'python' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Python lint
+        if: ${{ inputs.language == 'python' }}
+        run: |
+          pip install ruff
+          ruff check .
+
+  security-quick-scan:
+    name: Quick Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "table"
+          severity: "CRITICAL"
+          exit-code: "1"
+        continue-on-error: true
+
+      - name: Dependency audit
+        if: ${{ inputs.language == 'node' }}
+        run: |
+          npm install --package-lock-only 2>/dev/null || true
+          npm audit --omit=dev --audit-level=critical || echo "::warning::Critical vulnerabilities found"
+
+  dockerfile-lint:
+    name: Dockerfile Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Lint Dockerfile with Hadolint
+        if: ${{ hashFiles('Dockerfile') != '' }}
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+        continue-on-error: true
