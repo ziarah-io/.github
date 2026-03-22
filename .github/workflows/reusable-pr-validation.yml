@@ -45,6 +45,11 @@ on:
         required: false
         type: boolean
         default: true
+      run-build:
+        description: "Run build step (disable if build requires env vars not available in CI)"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -170,7 +175,7 @@ jobs:
           fi
 
       - name: Build
-        if: ${{ inputs.language == 'node' }}
+        if: ${{ inputs.language == 'node' && inputs.run-build != false }}
         env:
           DISABLE_ESLINT_PLUGIN: "true"
           NEXT_TELEMETRY_DISABLED: "1"
