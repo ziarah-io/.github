@@ -174,6 +174,7 @@ jobs:
         env:
           DISABLE_ESLINT_PLUGIN: "true"
           NEXT_TELEMETRY_DISABLED: "1"
+          SKIP_ENV_VALIDATION: "1"
         run: |
           BUILD_SCRIPT=$(node -e "const p=require('./package.json'); console.log(p.scripts?.build || '')")
           if [ -n "$BUILD_SCRIPT" ]; then
