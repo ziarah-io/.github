@@ -40,6 +40,11 @@ on:
         required: false
         type: boolean
         default: false
+      run-typescript:
+        description: "Run TypeScript type check (disable if tsconfig issues exist)"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -94,7 +99,6 @@ jobs:
 
       - name: Check for hardcoded secrets
         run: |
-          # Simple pattern matching for common secret patterns
           PATTERNS=(
             'password\s*[:=]\s*["\x27][^"\x27]{8,}'
             'api[_-]?key\s*[:=]\s*["\x27][A-Za-z0-9]{16,}'
@@ -159,7 +163,7 @@ jobs:
           fi
 
       - name: TypeScript check
-        if: ${{ inputs.language == 'node' }}
+        if: ${{ inputs.language == 'node' && inputs.run-typescript != false }}
         run: |
           if [ -f "tsconfig.json" ]; then
             npx tsc --noEmit || { echo "::error::TypeScript type checking failed"; exit 1; }
