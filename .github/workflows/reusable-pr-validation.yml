@@ -35,6 +35,11 @@ on:
         required: false
         type: boolean
         default: false
+      run-lint:
+        description: "Run linting (disable if prettier/eslint not configured)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -144,7 +149,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Lint
-        if: ${{ inputs.language == 'node' }}
+        if: ${{ inputs.language == 'node' && inputs.run-lint == true }}
         run: |
           if npm run lint --if-present 2>/dev/null; then
             echo "Lint passed"
@@ -175,7 +180,7 @@ jobs:
           python-version: ${{ inputs.python-version }}
 
       - name: Python lint
-        if: ${{ inputs.language == 'python' }}
+        if: ${{ inputs.language == 'python' && inputs.run-lint == true }}
         run: |
           pip install ruff
           ruff check .
