@@ -194,15 +194,66 @@ jobs:
 
 ---
 
-## 2. Trigger Map (final state)
+## 2. Trigger Map — One Workflow at a Time
 
-| Event | Workflows triggered |
-|---|---|
-| PR opened/updated to alpha or main | `pr-validation.yml` only |
-| Push to alpha | `deploy-alpha.yml` (CI → Security → Build → Deploy) |
-| Push to main | `deploy-prod.yml` (CI → Security → Build → Deploy) |
-| Nightly 2am | `security-scan.yml` |
-| Weekly Monday 6am | `ci.yml` |
+**Rule: when a deploy is running, no other workflow should independently trigger.**
+
+`deploy-alpha.yml` and `deploy-prod.yml` already run CI + security internally as gates
+before every build. If `security-scan.yml` or `ci.yml` also fire on push/PR events,
+you get duplicate parallel runs — wasting minutes and cluttering the Actions tab.
+
+| Event | Workflows triggered | Should NOT trigger |
+|---|---|---|
+| PR opened/updated to alpha or main | `pr-validation.yml` only | `security-scan.yml`, `ci.yml` |
+| Push to alpha | `deploy-alpha.yml` (CI → Security → Build → Deploy) | `security-scan.yml`, `ci.yml`, `pr-validation.yml` |
+| Push to main | `deploy-prod.yml` (CI → Security → Build → Deploy) | `security-scan.yml`, `ci.yml`, `pr-validation.yml` |
+| Nightly 2am | `security-scan.yml` | — |
+| Weekly Monday 6am | `ci.yml` | — |
+
+### How to enforce this
+
+**`security-scan.yml`** — schedule trigger only, never `push` or `pull_request`:
+
+```yaml
+on:
+  schedule:
+    - cron: "0 2 * * *"
+# DO NOT add:
+#   push:
+#     branches: [main, alpha]
+#   pull_request:
+#     branches: [main, alpha]
+```
+
+**`ci.yml`** — schedule trigger only, never `push` or `pull_request`:
+
+```yaml
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+# DO NOT add:
+#   push:
+#     branches: [main]
+#   pull_request:
+#     branches: [main, alpha]
+```
+
+**`pr-validation.yml`** — `pull_request` only, never `push`:
+
+```yaml
+on:
+  pull_request:
+    branches: [main, alpha]
+    types: [opened, synchronize, reopened]
+# DO NOT add:
+#   push:
+#     branches: [main, alpha]
+```
+
+> **Why this matters:** merging a PR to alpha triggers both `deploy-alpha.yml` AND
+> any workflow with `push: [alpha]`. With three devs merging throughout the day,
+> duplicate security scans stack up and slow everyone down. The deploy pipeline is
+> already the source of truth for CI + security gates.
 
 ---
 
@@ -393,7 +444,8 @@ git push origin alpha --force-with-lease
 |---|---|---|
 | `Invalid environment variables` in CI build | `@t3-oss/env-nextjs` validates at build time; env vars not in CI runners | Set `run-build: false` in `pr-validation.yml` and deploy workflow CI job |
 | `Commits must have verified signatures` | `signed-commits` ruleset with no bypass actors | Disable the ruleset (see §3) |
-| Duplicate workflow runs on push to main | `security-scan.yml` had `push: [main]` trigger | Keep `security-scan.yml` schedule-only |
+| Duplicate workflow runs on push to alpha/main | `security-scan.yml` or `ci.yml` has `push:` or `pull_request:` trigger | Both must be schedule-only (see §2) — deploy workflows already run CI + security internally |
+| 3 workflows firing when a PR is merged | `security-scan.yml` had `push: [main]` + deploy already runs security | Remove all push/PR triggers from `security-scan.yml` and `ci.yml` |
 | PR branch workflow changes don't take effect | GitHub uses base branch workflow for `pull_request` events | Merge the fix to the base branch first (use bypass rights), then PRs pick it up |
 | Push rejected: N unsigned commit violations | Feature branch created from local diverged branch | Always branch from `origin/alpha`: `git checkout -B <branch> origin/alpha` |
 | `gh pr merge --admin` blocked by ruleset | `--admin` bypasses legacy branch protections, not rulesets | Use `gh api repos/.../pulls/<N>/merge -X PUT` as the bypass actor user |
